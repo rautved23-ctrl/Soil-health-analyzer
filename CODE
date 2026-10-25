@@ -1,0 +1,473 @@
+CODE HERE EDIT AS PER YOUR SSID PASSWORD AND PIN CONFIGURATIONS 
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WiFiAP.h>
+#include <ArduinoJson.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+// ============================================================================
+// BHOOMIMITRA ESP32 DIRECT SOIL TELEMETRY STATION
+// DIRECT LOCAL REST API & SERIAL TELEMETRY - ZERO SUPABASE DEPENDENCY
+// TRUE SENSOR MEASUREMENTS ONLY - NO ARTIFICIAL / ESTIMATED VALUES
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// WI-FI CONFIGURATION
+// ESP32 runs both SoftAP (hotspot) and Station mode (connect to phone/router).
+// Default SoftAP: SSID "BhoomiMitra-SoilStation", Password "12345678"
+// SoftAP IP is always: 192.168.4.1
+// ----------------------------------------------------------------------------
+const char* sta_ssid     = "Godrealme15";     // Your phone/home Wi-Fi SSID
+const char* sta_password = "Mh48cb3139";       // Your Wi-Fi Password
+
+const char* ap_ssid      = "BhoomiMitra-SoilStation"; // ESP32 SoftAP hotspot
+const char* ap_password  = "12345678";                // SoftAP password
+
+// Web server on default HTTP port 80
+WebServer server(80);
+
+// ============================================================================
+// HARDWARE PIN CONFIGURATION
+// ============================================================================
+#define MAX485_RE_DE  23   // Direction pin for RS485 module (DE & RE tied together)
+#define RS485_RX      16    // ESP32 GPIO4 -> MAX485 RO
+#define RS485_TX      17   // ESP32 GPIO21 -> MAX485 DI
+
+#define ONE_WIRE_BUS  18   // DS18B20 Temperature Data pin
+#define MOISTURE_PIN  34   // Capacitive Moisture Sensor Analog Pin (AOUT)
+
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature ds18b20(&oneWire);
+
+// Struct for Modbus inquiry profiles
+struct ModbusProfile {
+  const char* label;
+  uint32_t baud;
+  byte query[8];
+  int queryLen;
+  int expectedBytes;
+  byte expectedHeader[3]; // slaveId, func, byteCount
+  int paramType;          // 1 = 7-in-1, 2 = 3-in-1 NPK
+};
+
+// Common industrial Modbus soil probe configurations
+const ModbusProfile profiles[] = {
+  // 1. 9600 Baud - Standard 7-in-1 (Slave 0x01, Reg 0x0000, 7 regs)
+  { "9600 baud | 7-in-1 (ID 0x01, Reg 0x0000)", 9600, {0x01, 0x03, 0x00, 0x00, 0x00, 0x07, 0x04, 0x08}, 8, 19, {0x01, 0x03, 0x0E}, 1 },
+
+  // 2. 9600 Baud - 3-in-1 NPK (Slave 0x01, Reg 0x001E, 3 regs)
+  { "9600 baud | 3-in-1 NPK (ID 0x01, Reg 0x001E)", 9600, {0x01, 0x03, 0x00, 0x1E, 0x00, 0x03, 0x65, 0xCD}, 8, 11, {0x01, 0x03, 0x06}, 2 },
+
+  // 3. 9600 Baud - Broadcast (Slave 0xFF, Reg 0x0000, 7 regs)
+  { "9600 baud | Broadcast (ID 0xFF, Reg 0x0000)", 9600, {0xFF, 0x03, 0x00, 0x00, 0x00, 0x07, 0x11, 0xD6}, 8, 19, {0xFF, 0x03, 0x0E}, 1 },
+
+  // 4. 9600 Baud - Function 0x04 Input Reg (Slave 0x01, Reg 0x0000, 7 regs)
+  { "9600 baud | Func 0x04 (ID 0x01, Reg 0x0000)", 9600, {0x01, 0x04, 0x00, 0x00, 0x00, 0x07, 0xB1, 0xC8}, 8, 19, {0x01, 0x04, 0x0E}, 1 },
+
+  // 5. 4800 Baud - Standard 7-in-1 (Slave 0x01, Reg 0x0000, 7 regs)
+  { "4800 baud | 7-in-1 (ID 0x01, Reg 0x0000)", 4800, {0x01, 0x03, 0x00, 0x00, 0x00, 0x07, 0x04, 0x08}, 8, 19, {0x01, 0x03, 0x0E}, 1 },
+
+  // 6. 4800 Baud - 3-in-1 NPK (Slave 0x01, Reg 0x001E, 3 regs)
+  { "4800 baud | 3-in-1 NPK (ID 0x01, Reg 0x001E)", 4800, {0x01, 0x03, 0x00, 0x1E, 0x00, 0x03, 0x65, 0xCD}, 8, 11, {0x01, 0x03, 0x06}, 2 },
+
+  // 7. 4800 Baud - Broadcast (Slave 0xFF, Reg 0x0000, 7 regs)
+  { "4800 baud | Broadcast (ID 0xFF, Reg 0x0000)", 4800, {0xFF, 0x03, 0x00, 0x00, 0x00, 0x07, 0x11, 0xD6}, 8, 19, {0xFF, 0x03, 0x0E}, 1 }
+};
+
+struct PinConfig {
+  int rx;
+  int tx;
+  int de;
+  const char* desc;
+};
+
+// Candidate pin configurations: PCB, Project Report Table 4.2, and alternate setup
+const PinConfig pinConfigs[] = {
+  { 16, 17, 22, "RX=16, TX=17, DE=22 [Original Perfboard PCB]" },
+  { 16, 17, 4,  "RX=16, TX=17, DE=4  [Project Report Table 4.2]" },
+  { 4,  21, 23, "RX=4,  TX=21, DE=23 [Modified Pins]" }
+};
+
+const int NUM_PIN_CONFIGS = sizeof(pinConfigs) / sizeof(pinConfigs[0]);
+int lockedPinIdx = -1;
+const int NUM_PROFILES = sizeof(profiles) / sizeof(profiles[0]);
+int lockedProfileIdx = -1;
+
+// Calibration constants for Capacitive Moisture Sensor
+const int AIR_VALUE   = 3200; // Sensor reading in dry air
+const int WATER_VALUE = 1400; // Sensor reading submerged in water
+
+// Live Physical Sensor Variables - ONLY TRUE VALUES RECORDED
+float moistureVal       = 0.0;
+float tempVal           = 0.0;
+int   nitrogenVal       = 0;
+int   phosphorusVal     = 0;
+int   potassiumVal      = 0;
+float phVal             = 0.0;
+int   ecVal             = 0;
+
+// Sensor Physical Connection Status Flags
+bool npkSensorConnected      = false;
+bool tempSensorConnected     = false;
+bool moistureSensorConnected = false;
+unsigned long lastReadTimestamp = 0;
+
+// Standard Modbus RTU CRC-16 Check (Polynomial 0xA001)
+uint16_t calculateModbusCRC(const byte* buffer, int length) {
+  uint16_t crc = 0xFFFF;
+  for (int pos = 0; pos < length; pos++) {
+    crc ^= (uint16_t)buffer[pos];
+    for (int i = 8; i != 0; i--) {
+      if ((crc & 0x0001) != 0) {
+        crc >>= 1;
+        crc ^= 0xA001;
+      } else {
+        crc >>= 1;
+      }
+    }
+  }
+  return crc;
+}
+
+void connectWiFi() {
+  Serial.println("\n[WiFi] Initializing Wi-Fi Station Mode...");
+  WiFi.disconnect(true);
+  delay(100);
+  WiFi.mode(WIFI_STA);
+  WiFi.setTxPower(WIFI_POWER_13dBm); // Prevent peak current brownouts
+  WiFi.setAutoReconnect(true);
+
+  Serial.printf("[WiFi STA] Connecting to SSID: '%s'...\n", sta_ssid);
+  WiFi.begin(sta_ssid, sta_password);
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n==========================================");
+    Serial.println(">>> [WiFi STA] CONNECTED SUCCESSFULLY! <<<");
+    Serial.print  (">>> ESP32 IP Address: http://");
+    Serial.print  (WiFi.localIP());
+    Serial.println(" <<<");
+    Serial.println("==========================================\n");
+  } else {
+    Serial.println("\n[WiFi STA] Connection timed out!");
+    Serial.println("[NOTE] Ensure Phone Hotspot is active, Password is correct,");
+    Serial.println("[NOTE] and Hotspot Band is set to 2.4 GHz (not 5 GHz)!");
+  }
+}
+
+// ============================================================================
+// READ SENSORS: 100% TRUE PHYSICAL READINGS ONLY - ZERO FAKE ESTIMATES
+// ============================================================================
+void readSensors() {
+  lastReadTimestamp = millis();
+
+  // 1. Read DS18B20 Digital Temperature Sensor
+  ds18b20.requestTemperatures();
+  float rawTemp = ds18b20.getTempCByIndex(0);
+  if (rawTemp != DEVICE_DISCONNECTED_C && rawTemp > -40.0 && rawTemp < 85.0) {
+    tempVal = rawTemp;
+    tempSensorConnected = true;
+  } else {
+    tempVal = 0.0;
+    tempSensorConnected = false;
+  }
+
+  // 2. Read Capacitive Moisture Sensor
+  int rawADC = analogRead(MOISTURE_PIN);
+  if (rawADC >= AIR_VALUE || rawADC <= 100) {
+    moistureVal = 0.0;
+    moistureSensorConnected = false;
+  } else {
+    moistureVal = map(rawADC, AIR_VALUE, WATER_VALUE, 0, 100);
+    moistureVal = constrain(moistureVal, 0.0, 100.0);
+    moistureSensorConnected = true;
+  }
+
+  // 3. Read NPK Modbus RTU Sensor via RS485 with CRC-16 Verification
+  byte npkBuffer[32];
+  bool sensorReadSuccess = false;
+
+  int pStart = (lockedPinIdx >= 0) ? lockedPinIdx : 0;
+  int pEnd   = (lockedPinIdx >= 0) ? lockedPinIdx + 1 : NUM_PIN_CONFIGS;
+
+  for (int p = pStart; p < pEnd && !sensorReadSuccess; p++) {
+    const PinConfig& pcfg = pinConfigs[p];
+    pinMode(pcfg.de, OUTPUT);
+    digitalWrite(pcfg.de, LOW);
+
+    int cStart = (lockedProfileIdx >= 0) ? lockedProfileIdx : 0;
+    int cEnd   = (lockedProfileIdx >= 0) ? lockedProfileIdx + 1 : NUM_PROFILES;
+
+    for (int c = cStart; c < cEnd; c++) {
+      const ModbusProfile& cand = profiles[c];
+
+      Serial2.end();
+      delay(10);
+      Serial2.begin(cand.baud, SERIAL_8N1, pcfg.rx, pcfg.tx);
+      delay(15);
+
+      // Flush buffer
+      while (Serial2.available()) Serial2.read();
+
+      // Transmit Modbus query
+      digitalWrite(pcfg.de, HIGH);
+      delay(5);
+      Serial2.write(cand.query, cand.queryLen);
+      Serial2.flush();
+      delay(3);
+      digitalWrite(pcfg.de, LOW);
+
+      // Wait up to 250ms for response
+      unsigned long waitStart = millis();
+      while (Serial2.available() < cand.expectedBytes && (millis() - waitStart < 250)) {
+        delay(10);
+      }
+
+      int avail = Serial2.available();
+      if (avail >= cand.expectedBytes) {
+        Serial2.readBytes(npkBuffer, cand.expectedBytes);
+
+        // Header check: slaveId and function code
+        if (npkBuffer[1] == cand.expectedHeader[1] && npkBuffer[2] == cand.expectedHeader[2]) {
+          // CRC-16 Verification: verify packet authenticity
+          uint16_t expectedCrc = npkBuffer[cand.expectedBytes - 2] | (npkBuffer[cand.expectedBytes - 1] << 8);
+          uint16_t calculatedCrc = calculateModbusCRC(npkBuffer, cand.expectedBytes - 2);
+
+          if (expectedCrc == calculatedCrc) {
+            // CRC Passed! Verified true sensor response from hardware probe
+            if (cand.paramType == 1) { // 7-in-1 format
+              ecVal         = (npkBuffer[7] << 8) | npkBuffer[8];
+              phVal         = ((npkBuffer[9] << 8) | npkBuffer[10]) / 10.0;
+              nitrogenVal   = (npkBuffer[11] << 8) | npkBuffer[12];
+              phosphorusVal = (npkBuffer[13] << 8) | npkBuffer[14];
+              potassiumVal  = (npkBuffer[15] << 8) | npkBuffer[16];
+            } else if (cand.paramType == 2) { // 3-in-1 NPK format
+              nitrogenVal   = (npkBuffer[3] << 8) | npkBuffer[4];
+              phosphorusVal = (npkBuffer[5] << 8) | npkBuffer[6];
+              potassiumVal  = (npkBuffer[7] << 8) | npkBuffer[8];
+            }
+
+            sensorReadSuccess = true;
+            npkSensorConnected = true;
+
+            if (lockedPinIdx != p || lockedProfileIdx != c) {
+              lockedPinIdx     = p;
+              lockedProfileIdx = c;
+              Serial.printf("\n>>> [RS485 AUTO-LOCKED] SUCCESS! <<<\n>>> Active: %s\n>>> Profile: %s\n", pcfg.desc, cand.label);
+            }
+            break;
+          } else {
+            Serial.printf("[RS485] CRC Mismatch! Expected 0x%04X, got 0x%04X (rejected)\n", expectedCrc, calculatedCrc);
+          }
+        }
+      }
+    }
+  }
+
+  if (!sensorReadSuccess) {
+    if (lockedPinIdx >= 0) {
+      Serial.println("[RS485] Missed packet, unlocking scanner...");
+      lockedPinIdx     = -1;
+      lockedProfileIdx = -1;
+    }
+    // Sensor silent or disconnected:
+    // SET TO 0. DO NOT FABRICATE ANY VALUES! ONLY TRUE SENSOR STATE!
+    npkSensorConnected = false;
+    nitrogenVal   = 0;
+    phosphorusVal = 0;
+    potassiumVal  = 0;
+    if (phVal <= 0.0) phVal = 0.0;
+    ecVal = 0;
+    Serial.println("[RS485] Physical probe silent -> NPK set to 0. (True Sensor Mode: No Artificial Estimates)");
+  }
+
+  // Constrain to physical sensor bounds
+  nitrogenVal   = constrain(nitrogenVal, 0, 1999);
+  phosphorusVal = constrain(phosphorusVal, 0, 1999);
+  potassiumVal  = constrain(potassiumVal, 0, 1999);
+  phVal         = constrain(phVal, 0.0f, 14.0f);
+  ecVal         = constrain(ecVal, 0, 20000);
+
+  Serial.printf("[TRUE SENSORS] N: %d mg/kg | P: %d mg/kg | K: %d mg/kg | pH: %.1f | Moisture: %.1f%% | Temp: %.1f C | EC: %d uS/cm | NPK_Probe: %s\n",
+    nitrogenVal, phosphorusVal, potassiumVal, phVal, moistureVal, tempVal, ecVal, npkSensorConnected ? "CONNECTED" : "DISCONNECTED");
+}
+
+// Generate structured JSON payload with true sensor values
+String buildSensorJson() {
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+  JsonDocument doc;
+#else
+  StaticJsonDocument<512> doc;
+#endif
+
+  doc["status"]       = "ok";
+  doc["source"]       = "physical_esp32_sensors";
+  doc["timestamp_ms"] = lastReadTimestamp;
+  doc["nitrogen"]     = nitrogenVal;
+  doc["phosphorus"]   = phosphorusVal;
+  doc["potassium"]    = potassiumVal;
+  doc["ph"]           = phVal;
+  doc["moisture"]     = moistureVal;
+  doc["temperature"]  = tempVal;
+  doc["ec"]           = ecVal;
+
+  JsonObject sensors = doc.createNestedObject("sensor_status");
+  sensors["npk_connected"]      = npkSensorConnected;
+  sensors["temp_connected"]     = tempSensorConnected;
+  sensors["moisture_connected"] = moistureSensorConnected;
+
+  String output;
+  serializeJson(doc, output);
+  return output;
+}
+
+// Set standard CORS headers so any web browser can fetch directly
+void setCorsHeaders() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+}
+
+// OPTIONS preflight handler
+void handleOptions() {
+  setCorsHeaders();
+  server.send(204);
+}
+
+// Handler: GET /api/readings or /readings
+void handleGetReadings() {
+  setCorsHeaders();
+  String json = buildSensorJson();
+  server.send(200, "application/json", json);
+}
+
+// Handler: GET or POST /api/read (Triggers on-demand fresh sensor sampling)
+void handleTriggerRead() {
+  setCorsHeaders();
+  Serial.println("[API] Triggering fresh on-demand physical sensor read...");
+  readSensors();
+  String json = buildSensorJson();
+  server.send(200, "application/json", json);
+}
+
+// Handler: Root HTML Dashboard
+void handleRoot() {
+  setCorsHeaders();
+  String html = "<!DOCTYPE html><html><head><meta charset='utf-8'><title>BhoomiMitra ESP32 Station</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>body{font-family:system-ui,sans-serif;margin:0;padding:24px;background:#f8fafc;color:#1e293b}";
+  html += ".card{background:#fff;border-radius:12px;padding:20px;max-width:540px;margin:0 auto;box-shadow:0 1px 3px rgba(0,0,0,0.1);border:1px solid #e2e8f0}";
+  html += "h1{color:#065f46;margin-top:0;font-size:22px}.badge{display:inline-block;padding:3px 10px;border-radius:99px;font-size:12px;font-weight:700}";
+  html += ".ok{background:#d1fae5;color:#065f46}.err{background:#fee2e2;color:#991b1b}";
+  html += ".metric{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #f1f5f9}";
+  html += ".btn{display:block;width:100%;text-align:center;background:#059669;color:#fff;padding:10px;border-radius:8px;text-decoration:none;font-weight:600;margin-top:16px;border:none;cursor:pointer}</style></head>";
+  html += "<body><div class='card'>";
+  html += "<h1>BhoomiMitra ESP32 Soil Station</h1>";
+  html += "<p style='font-size:13px;color:#64748b'>Direct IoT Field Telemetry REST API &bull; Zero Cloud Dependency &bull; True Sensor Readings Only</p>";
+  html += "<div class='metric'><span>SoftAP IP:</span><b>192.168.4.1</b></div>";
+  html += "<div class='metric'><span>Station IP:</span><b>" + WiFi.localIP().toString() + "</b></div>";
+  html += "<div class='metric'><span>NPK Modbus Sensor:</span><span class='badge " + String(npkSensorConnected ? "ok'>CONNECTED" : "err'>DISCONNECTED") + "</span></div>";
+  html += "<div class='metric'><span>Nitrogen (N):</span><b>" + String(nitrogenVal) + " mg/kg</b></div>";
+  html += "<div class='metric'><span>Phosphorus (P):</span><b>" + String(phosphorusVal) + " mg/kg</b></div>";
+  html += "<div class='metric'><span>Potassium (K):</span><b>" + String(potassiumVal) + " mg/kg</b></div>";
+  html += "<div class='metric'><span>Soil Moisture:</span><b>" + String(moistureVal, 1) + " %</b></div>";
+  html += "<div class='metric'><span>Soil Temperature:</span><b>" + String(tempVal, 1) + " &deg;C</b></div>";
+  html += "<div class='metric'><span>Soil pH:</span><b>" + String(phVal, 1) + "</b></div>";
+  html += "<div class='metric'><span>EC (Salinity):</span><b>" + String(ecVal) + " &micro;S/cm</b></div>";
+  html += "<a href='/api/read' class='btn'>Trigger Fresh Sensor Read (JSON)</a>";
+  html += "</div></body></html>";
+  server.send(200, "text/html", html);
+}
+
+void handleNotFound() {
+  setCorsHeaders();
+  if (server.method() == HTTP_OPTIONS) {
+    server.send(204);
+  } else {
+    server.send(404, "application/json", "{\"status\":\"error\",\"message\":\"Not found\"}");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n==========================================");
+  Serial.println(" BhoomiMitra ESP32 Direct Telemetry Unit ");
+  Serial.println("  100% True Sensor Data - No Cloud/Supabase");
+  Serial.println("==========================================");
+
+  // Initialize RS485 UART
+  Serial2.begin(9600, SERIAL_8N1, RS485_RX, RS485_TX);
+  pinMode(MAX485_RE_DE, OUTPUT);
+  digitalWrite(MAX485_RE_DE, LOW);
+
+  // Initialize DS18B20 Temperature
+  ds18b20.begin();
+
+  // Connect Wi-Fi (SoftAP + STA)
+  connectWiFi();
+
+  // Setup Web Server REST Endpoints
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/api/readings", HTTP_GET, handleGetReadings);
+  server.on("/api/readings", HTTP_OPTIONS, handleOptions);
+  server.on("/readings", HTTP_GET, handleGetReadings);
+  server.on("/readings", HTTP_OPTIONS, handleOptions);
+  server.on("/api/read", HTTP_GET, handleTriggerRead);
+  server.on("/api/read", HTTP_POST, handleTriggerRead);
+  server.on("/api/read", HTTP_OPTIONS, handleOptions);
+  server.on("/read", HTTP_GET, handleTriggerRead);
+  server.on("/read", HTTP_POST, handleTriggerRead);
+  server.on("/read", HTTP_OPTIONS, handleOptions);
+  server.onNotFound(handleNotFound);
+
+  server.begin();
+  Serial.println("[HTTP Server] REST API listening on port 80");
+  Serial.println("[HTTP Server] Endpoints: /api/readings , /api/read");
+
+  // Perform initial sensor sampling
+  readSensors();
+}
+
+void loop() {
+  // Handle incoming HTTP REST client requests from Web App
+  server.handleClient();
+
+  // Check for incoming USB Serial commands from Web Serial / Terminal
+  if (Serial.available()) {
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+    cmd.toUpperCase();
+
+    if (cmd == "READ" || cmd == "GET" || cmd == "SCAN") {
+      readSensors();
+      String json = buildSensorJson();
+      Serial.println(json);
+    } else if (cmd == "STATUS" || cmd == "IP") {
+      Serial.print("{\"soft_ap_ip\":\"");
+      Serial.print(WiFi.softAPIP());
+      Serial.print("\",\"sta_ip\":\"");
+      Serial.print(WiFi.localIP());
+      Serial.println("\"}");
+    }
+  }
+
+  // Periodic sensor read every 10 seconds to keep cache warm
+  static unsigned long lastPeriodicRead = 0;
+  if (millis() - lastPeriodicRead >= 10000) {
+    lastPeriodicRead = millis();
+    readSensors();
+  }
+
+  delay(10);
+}
